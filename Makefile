@@ -32,7 +32,15 @@ ISO_BUCKET ?= minikube/iso
 
 MINIKUBE_VERSION ?= $(ISO_VERSION)
 MINIKUBE_BUCKET ?= minikube/releases
+MINIKUBE_UPLOAD_KEY ?= $(HOME)/.config/gcloud/k8s-minikube-20e2437ce844.json
 MINIKUBE_UPLOAD_LOCATION := gs://${MINIKUBE_BUCKET}
+JUMPHOST_KEY ?= /root/keys/id_rsa
+
+#PULL_NUMBER env variable will usually come from the Prow environment
+BUILD_BUCKET ?= minikube-builds
+BUILD_UPLOAD_LOCATION := gs://${BUILD_BUCKET}/${PULL_NUMBER}
+
+REMOTE_TEST_DIR := minikube-tests-$(shell dbus-uuidgen)
 
 KERNEL_VERSION ?= 4.16.14
 
@@ -126,7 +134,7 @@ minikube_iso: # old target kept for making tests happy
 	echo $(ISO_VERSION) > deploy/iso/minikube-iso/board/coreos/minikube/rootfs-overlay/etc/VERSION
 	if [ ! -d $(BUILD_DIR)/buildroot ]; then \
 		mkdir -p $(BUILD_DIR); \
-		git clone --depth=1 --branch=$(BUILDROOT_BRANCH) https://github.com/buildroot/buildroot $(BUILD_DIR)/buildroot; \
+		git clone --branch=$(BUILDROOT_BRANCH) https://github.com/buildroot/buildroot $(BUILD_DIR)/buildroot; \
 	fi;
 	$(MAKE) BR2_EXTERNAL=../../deploy/iso/minikube-iso minikube_defconfig -C $(BUILD_DIR)/buildroot
 	$(MAKE) -C $(BUILD_DIR)/buildroot
@@ -270,7 +278,7 @@ out/docker-machine-driver-hyperkit:
 ifeq ($(MINIKUBE_BUILD_IN_DOCKER),y)
 	$(call DOCKER,$(HYPERKIT_BUILD_IMAGE),CC=o64-clang CXX=o64-clang++ /usr/bin/make $@)
 else
-	GOOS=darwin CGO_ENABLED=1 go build -o $(BUILD_DIR)/docker-machine-driver-hyperkit k8s.io/minikube/cmd/drivers/hyperkit
+	GOOS=darwin CGO_ENABLED=1 CC=o64-clang CXX=o64-clang++ go build -o $(BUILD_DIR)/docker-machine-driver-hyperkit k8s.io/minikube/cmd/drivers/hyperkit
 endif
 
 .PHONY: install-hyperkit-driver
@@ -325,6 +333,18 @@ release-iso: minikube_iso checksum
 release-minikube: out/minikube checksum
 	gsutil cp out/minikube-$(GOOS)-$(GOARCH) $(MINIKUBE_UPLOAD_LOCATION)/$(MINIKUBE_VERSION)/minikube-$(GOOS)-$(GOARCH)
 	gsutil cp out/minikube-$(GOOS)-$(GOARCH).sha256 $(MINIKUBE_UPLOAD_LOCATION)/$(MINIKUBE_VERSION)/minikube-$(GOOS)-$(GOARCH).sha256
+
+.PHONY: push-build
+push-build: out/minikube checksum
+	cp -r test/integration/testdata out
+	gcloud auth activate-service-account --key-file=$(MINIKUBE_UPLOAD_KEY)
+	gsutil cp -r out/*  $(BUILD_UPLOAD_LOCATION)
+	gsutil cp -r hack/jenkins/*  $(BUILD_UPLOAD_LOCATION)
+
+.PHONY: test-linux-kvm
+test-linux-kvm:
+	ssh-agent bash -c "ssh-add $(JUMPHOST_KEY)"
+	ssh -F hack/prow/ssh_config -i $(JUMPHOST_KEY) kvmnode "mkdir -p $(REMOTE_TEST_DIR) && gsutil cp -r $(BUILD_UPLOAD_LOCATION)/* $(REMOTE_TEST_DIR) && cd $(REMOTE_TEST_DIR) && bash -x linux_integration_tests_kvm.sh"
 
 out/docker-machine-driver-kvm2.d:
 	$(MAKEDEPEND) out/docker-machine-driver-kvm2 $(ORG) $^ $(KVM_DRIVER_FILES) > $@
